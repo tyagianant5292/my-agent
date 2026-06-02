@@ -1,0 +1,21 @@
+# Render Blueprint — is repo ko Render se connect karoge to yeh service auto-detect hoti hai.
+# Dashboard me API_KEY, BASE_URL, MODEL, DATABASE_URL, ALLOWED_ORIGINS bharo (sync:false = secret).
+services:
+  - type: web
+    name: my-agent-api
+    runtime: python
+    rootDir: backend
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
+    envVars:
+      - key: API_KEY
+        sync: false
+      - key: BASE_URL
+        sync: false
+      - key: MODEL
+        sync: false
+      - key: DATABASE_URL
+        sync: false
+      - key: ALLOWED_ORIGINS
+        sync: false
