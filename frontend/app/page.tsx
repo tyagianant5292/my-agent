@@ -53,9 +53,50 @@ export default function Home() {
     if (!hasMedia) setMicOk(false);
     const SR = (window as any).SpeechRecognition || (window as any).webkitSpeechRecognition;
     if (!SR) setWakeOk(false);
+    // Warm up the free-tier backend so it's awake by the time the user talks.
+    fetch(`${API_URL}/api/health`).catch(() => {});
   }, []);
 
   // ---------- helpers ----------
+  function setLastAssistant(content: string) {
+    setMessages((m) => {
+      const copy = [...m];
+      for (let i = copy.length - 1; i >= 0; i--) {
+        if (copy[i].role === "assistant") {
+          copy[i] = { ...copy[i], content };
+          break;
+        }
+      }
+      return copy;
+    });
+  }
+
+  // Retries through free-tier cold starts (network errors / 502-504) instead of
+  // failing instantly with "Failed to fetch".
+  async function fetchWithRetry(
+    url: string,
+    opts: RequestInit,
+    onRetry?: (attempt: number) => void,
+    tries = 15,
+    delay = 4000,
+  ): Promise<Response> {
+    let lastErr: unknown;
+    for (let i = 0; i < tries; i++) {
+      try {
+        const res = await fetch(url, opts);
+        if (res.status >= 502 && res.status <= 504) throw new Error(`server ${res.status}`);
+        return res;
+      } catch (e) {
+        lastErr = e;
+        if (i < tries - 1) {
+          onRetry?.(i);
+          await new Promise((r) => setTimeout(r, delay));
+        }
+      }
+    }
+    throw lastErr instanceof Error ? lastErr : new Error("Failed to fetch");
+  }
+
   function speak(text: string): Promise<void> {
     return new Promise((resolve) => {
       if (typeof window.speechSynthesis === "undefined" || !text) return resolve();
@@ -257,7 +298,7 @@ export default function Home() {
       const fd = new FormData();
       fd.append("file", blob, "audio.webm");
       fd.append("language", langRef.current.startsWith("hi") ? "hi" : "en");
-      const res = await fetch(`${API_URL}/api/transcribe`, { method: "POST", body: fd });
+      const res = await fetchWithRetry(`${API_URL}/api/transcribe`, { method: "POST", body: fd });
       if (!res.ok) throw new Error(`Transcribe error: ${res.status}`);
       const { text } = await res.json();
       if (!text || !text.trim()) { exitActive(); return; }
@@ -271,24 +312,35 @@ export default function Home() {
   async function sendMessage(text: string, spoken: boolean) {
     const trimmed = text.trim();
     if (!trimmed) return;
-    setMessages((m) => [...m, { role: "user", content: trimmed }]);
+    setMessages((m) => [
+      ...m,
+      { role: "user", content: trimmed },
+      { role: "assistant", content: "…" },
+    ]);
     setInput("");
     setStatus("thinking");
 
     let reply = "";
     try {
-      const res = await fetch(`${API_URL}/api/chat`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ message: trimmed, conversation_id: conversationIdRef.current }),
-      });
-      if (!res.ok) throw new Error(`Server error: ${res.status}`);
+      const res = await fetchWithRetry(
+        `${API_URL}/api/chat`,
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ message: trimmed, conversation_id: conversationIdRef.current }),
+        },
+        (attempt) =>
+          setLastAssistant(`🟡 Waking the assistant… (free hosting cold start ~${(attempt + 1) * 4}s)`),
+      );
+      if (!res.ok) throw new Error(`Server error ${res.status}`);
       const data = await res.json();
       conversationIdRef.current = data.conversation_id;
       reply = data.reply;
-      setMessages((m) => [...m, { role: "assistant", content: reply }]);
-    } catch (err) {
-      setMessages((m) => [...m, { role: "assistant", content: `⚠️ ${(err as Error).message}` }]);
+      setLastAssistant(reply);
+    } catch {
+      setLastAssistant(
+        "⚠️ Couldn't reach the assistant. The free server may be asleep — please try again in a moment.",
+      );
     }
 
     if (spoken && reply) {
