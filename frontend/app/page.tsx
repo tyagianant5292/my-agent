@@ -4,26 +4,32 @@ import { useEffect, useRef, useState } from "react";
 
 const API_URL = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
 
-// --- Voice Activity Detection (VAD) tuning — zarurat pade to badlo ---
-const SPEECH_START = 0.05; // isse upar RMS = bol raha hai
-const SILENCE = 0.025; // isse niche RMS = chup
-const SILENCE_MS = 1200; // itni der chup -> recording stop
-const NO_SPEECH_MS = 7000; // itni der me kuch na bola -> dobara suno
-const MAX_MS = 20000; // safety: max recording length
+// --- Voice Activity Detection (VAD) tuning ---
+const SPEECH_START = 0.05;
+const SILENCE = 0.025;
+const SILENCE_MS = 1200;
+const NO_SPEECH_MS = 6000;
+const MAX_MS = 20000;
+
+// Wake phrase matcher — lenient for STT variants of "Hey Tyagi".
+const WAKE_RE = /\b(hey|hay|hi|ok|okay|a)\s*(tyagi|tyagee|tyaji|tiagi|tyag|yagi|tyagy|tagi)\b/i;
 
 type Message = { role: "user" | "assistant"; content: string };
-type Status = "idle" | "listening" | "transcribing" | "thinking" | "speaking";
+type Status = "idle" | "wake" | "listening" | "transcribing" | "thinking" | "speaking";
 
 export default function Home() {
   const [messages, setMessages] = useState<Message[]>([]);
   const [input, setInput] = useState("");
   const [status, setStatus] = useState<Status>("idle");
-  const [voiceOn, setVoiceOn] = useState(false);
+  const [power, setPower] = useState(false);
   const [lang, setLang] = useState("en-IN");
-  const [supported, setSupported] = useState(true);
+  const [micOk, setMicOk] = useState(true);
+  const [wakeOk, setWakeOk] = useState(true);
 
   const endRef = useRef<HTMLDivElement>(null);
-  const voiceOnRef = useRef(false);
+  const orbRef = useRef<HTMLDivElement>(null);
+  const powerRef = useRef(false);
+  const activeRef = useRef(false);
   const langRef = useRef(lang);
   const conversationIdRef = useRef<string | null>(null);
 
@@ -32,34 +38,31 @@ export default function Home() {
   const audioCtxRef = useRef<AudioContext | null>(null);
   const rafRef = useRef<number | null>(null);
 
-  useEffect(() => {
-    voiceOnRef.current = voiceOn;
-  }, [voiceOn]);
-  useEffect(() => {
-    langRef.current = lang;
-  }, [lang]);
-  useEffect(() => {
-    endRef.current?.scrollIntoView({ behavior: "smooth" });
-  }, [messages, status]);
+  const recRef = useRef<any>(null);
+  const recOnRef = useRef(false);
+
+  useEffect(() => { powerRef.current = power; }, [power]);
+  useEffect(() => { langRef.current = lang; }, [lang]);
+  useEffect(() => { endRef.current?.scrollIntoView({ behavior: "smooth" }); }, [messages, status]);
 
   useEffect(() => {
     const hasMedia =
       typeof navigator !== "undefined" &&
       !!navigator.mediaDevices &&
       typeof window.MediaRecorder !== "undefined";
-    if (!hasMedia) setSupported(false);
+    if (!hasMedia) setMicOk(false);
+    const SR = (window as any).SpeechRecognition || (window as any).webkitSpeechRecognition;
+    if (!SR) setWakeOk(false);
   }, []);
 
-  // ---- Text-to-Speech: agent ka jawab bolna (browser) ----
+  // ---------- helpers ----------
   function speak(text: string): Promise<void> {
     return new Promise((resolve) => {
-      if (typeof window.speechSynthesis === "undefined") return resolve();
+      if (typeof window.speechSynthesis === "undefined" || !text) return resolve();
       window.speechSynthesis.cancel();
       const u = new SpeechSynthesisUtterance(text);
       u.lang = langRef.current;
-      const match = window.speechSynthesis
-        .getVoices()
-        .find((v) => v.lang === langRef.current);
+      const match = window.speechSynthesis.getVoices().find((v) => v.lang === langRef.current);
       if (match) u.voice = match;
       u.onend = () => resolve();
       u.onerror = () => resolve();
@@ -67,9 +70,35 @@ export default function Home() {
     });
   }
 
+  function chime() {
+    try {
+      const Ctx = window.AudioContext || (window as any).webkitAudioContext;
+      const ctx = new Ctx();
+      const now = ctx.currentTime;
+      [880, 1320].forEach((f, i) => {
+        const o = ctx.createOscillator();
+        const g = ctx.createGain();
+        o.frequency.value = f;
+        o.type = "sine";
+        o.connect(g);
+        g.connect(ctx.destination);
+        const t = now + i * 0.09;
+        g.gain.setValueAtTime(0, t);
+        g.gain.linearRampToValueAtTime(0.15, t + 0.02);
+        g.gain.exponentialRampToValueAtTime(0.001, t + 0.18);
+        o.start(t);
+        o.stop(t + 0.2);
+      });
+      setTimeout(() => ctx.close().catch(() => {}), 500);
+    } catch {
+      /* ignore */
+    }
+  }
+
   function cleanupAudio() {
     if (rafRef.current) cancelAnimationFrame(rafRef.current);
     rafRef.current = null;
+    orbRef.current?.style.setProperty("--amp", "0");
     mediaStreamRef.current?.getTracks().forEach((t) => t.stop());
     mediaStreamRef.current = null;
     audioCtxRef.current?.close().catch(() => {});
@@ -82,9 +111,75 @@ export default function Home() {
     if (rec && rec.state === "recording") rec.stop();
   }
 
-  // ---- Mic se record karo + silence detect karke auto-stop ----
+  // ---------- wake-word listening ----------
+  function startWake() {
+    setStatus("wake");
+    if (!wakeOk) return; // no SpeechRecognition — user taps the orb instead
+    const SR = (window as any).SpeechRecognition || (window as any).webkitSpeechRecognition;
+    if (!SR) return;
+    if (recOnRef.current) return;
+    const rec = new SR();
+    rec.lang = "en-IN";
+    rec.continuous = true;
+    rec.interimResults = true;
+    rec.onresult = (e: any) => {
+      for (let i = e.resultIndex; i < e.results.length; i++) {
+        const txt = e.results[i][0].transcript as string;
+        if (WAKE_RE.test(txt)) {
+          onWake();
+          return;
+        }
+      }
+    };
+    rec.onerror = () => {};
+    rec.onend = () => {
+      recOnRef.current = false;
+      // auto-restart while powered and not in a command session
+      if (powerRef.current && !activeRef.current) {
+        setTimeout(() => startWake(), 250);
+      }
+    };
+    recRef.current = rec;
+    try {
+      rec.start();
+      recOnRef.current = true;
+    } catch {
+      recOnRef.current = false;
+    }
+  }
+
+  function stopWake() {
+    const rec = recRef.current;
+    recOnRef.current = false;
+    if (rec) {
+      rec.onend = null;
+      try { rec.stop(); } catch { /* ignore */ }
+      try { rec.abort(); } catch { /* ignore */ }
+    }
+    recRef.current = null;
+  }
+
+  async function onWake() {
+    if (activeRef.current) return;
+    stopWake();
+    activeRef.current = true;
+    chime();
+    setStatus("speaking");
+    await speak(langRef.current.startsWith("hi") ? "Haan, boliye." : "Yes?");
+    startRecording();
+  }
+
+  function exitActive() {
+    activeRef.current = false;
+    stopRecording();
+    cleanupAudio();
+    if (powerRef.current) startWake();
+    else setStatus("idle");
+  }
+
+  // ---------- command recording (VAD) ----------
   async function startRecording() {
-    if (!voiceOnRef.current) return;
+    if (!activeRef.current) return;
     try {
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
       mediaStreamRef.current = stream;
@@ -94,30 +189,17 @@ export default function Home() {
         : MediaRecorder.isTypeSupported("audio/webm")
           ? "audio/webm"
           : "";
-      const rec = mime
-        ? new MediaRecorder(stream, { mimeType: mime })
-        : new MediaRecorder(stream);
+      const rec = mime ? new MediaRecorder(stream, { mimeType: mime }) : new MediaRecorder(stream);
       mediaRecorderRef.current = rec;
 
       const chunks: BlobPart[] = [];
       let speechDetected = false;
 
-      rec.ondataavailable = (e) => {
-        if (e.data.size > 0) chunks.push(e.data);
-      };
-
+      rec.ondataavailable = (e) => { if (e.data.size > 0) chunks.push(e.data); };
       rec.onstop = async () => {
         cleanupAudio();
-        if (!voiceOnRef.current) {
-          setStatus("idle");
-          return;
-        }
-        if (!speechDetected) {
-          // Kuch bola hi nahi -> dobara suno
-          setStatus("idle");
-          setTimeout(() => voiceOnRef.current && startRecording(), 200);
-          return;
-        }
+        if (!activeRef.current) return;
+        if (!speechDetected) { exitActive(); return; } // silence -> sleep
         const blob = new Blob(chunks, { type: mime || "audio/webm" });
         await transcribeAndSend(blob);
       };
@@ -125,9 +207,7 @@ export default function Home() {
       rec.start();
       setStatus("listening");
 
-      // VAD: volume monitor karo
-      const AudioCtx =
-        window.AudioContext || (window as any).webkitAudioContext;
+      const AudioCtx = window.AudioContext || (window as any).webkitAudioContext;
       const audioCtx = new AudioCtx();
       audioCtxRef.current = audioCtx;
       const source = audioCtx.createMediaStreamSource(stream);
@@ -149,17 +229,13 @@ export default function Home() {
           sum += a * a;
         }
         const rms = Math.sqrt(sum / data.length);
+        orbRef.current?.style.setProperty("--amp", Math.min(0.6, rms * 3).toFixed(3));
         const now = Date.now();
-        if (rms > SPEECH_START) {
-          speechDetected = true;
-          lastVoiceAt = now;
-        } else if (rms > SILENCE) {
-          lastVoiceAt = now;
-        }
+        if (rms > SPEECH_START) { speechDetected = true; lastVoiceAt = now; }
+        else if (rms > SILENCE) { lastVoiceAt = now; }
 
         const elapsed = now - startedAt;
         const silenceFor = now - lastVoiceAt;
-
         if (speechDetected && silenceFor > SILENCE_MS) return stopRecording();
         if (!speechDetected && elapsed > NO_SPEECH_MS) return stopRecording();
         if (elapsed > MAX_MS) return stopRecording();
@@ -167,11 +243,11 @@ export default function Home() {
       };
       rafRef.current = requestAnimationFrame(tick);
     } catch (err) {
-      setVoiceOn(false);
-      voiceOnRef.current = false;
-      setStatus("idle");
+      activeRef.current = false;
       cleanupAudio();
-      alert("Mic nahi mila / permission denied: " + (err as Error).message);
+      if (powerRef.current) startWake();
+      else setStatus("idle");
+      alert("Mic error: " + (err as Error).message);
     }
   }
 
@@ -181,149 +257,150 @@ export default function Home() {
       const fd = new FormData();
       fd.append("file", blob, "audio.webm");
       fd.append("language", langRef.current.startsWith("hi") ? "hi" : "en");
-      const res = await fetch(`${API_URL}/api/transcribe`, {
-        method: "POST",
-        body: fd,
-      });
+      const res = await fetch(`${API_URL}/api/transcribe`, { method: "POST", body: fd });
       if (!res.ok) throw new Error(`Transcribe error: ${res.status}`);
       const { text } = await res.json();
-      if (!text || !text.trim()) {
-        setStatus("idle");
-        if (voiceOnRef.current) setTimeout(() => startRecording(), 200);
-        return;
-      }
+      if (!text || !text.trim()) { exitActive(); return; }
       await sendMessage(text.trim(), true);
     } catch (err) {
-      setMessages((m) => [
-        ...m,
-        { role: "assistant", content: `⚠️ ${(err as Error).message}` },
-      ]);
-      setStatus("idle");
-      if (voiceOnRef.current)
-        setTimeout(() => voiceOnRef.current && startRecording(), 600);
+      setMessages((m) => [...m, { role: "assistant", content: `⚠️ ${(err as Error).message}` }]);
+      exitActive();
     }
   }
 
-  async function sendMessage(text: string, speakReply: boolean) {
+  async function sendMessage(text: string, spoken: boolean) {
     const trimmed = text.trim();
     if (!trimmed) return;
-
     setMessages((m) => [...m, { role: "user", content: trimmed }]);
     setInput("");
     setStatus("thinking");
 
+    let reply = "";
     try {
       const res = await fetch(`${API_URL}/api/chat`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          message: trimmed,
-          conversation_id: conversationIdRef.current,
-        }),
+        body: JSON.stringify({ message: trimmed, conversation_id: conversationIdRef.current }),
       });
       if (!res.ok) throw new Error(`Server error: ${res.status}`);
       const data = await res.json();
       conversationIdRef.current = data.conversation_id;
-      setMessages((m) => [...m, { role: "assistant", content: data.reply }]);
-
-      if (speakReply) {
-        setStatus("speaking");
-        await speak(data.reply);
-      }
+      reply = data.reply;
+      setMessages((m) => [...m, { role: "assistant", content: reply }]);
     } catch (err) {
-      setMessages((m) => [
-        ...m,
-        { role: "assistant", content: `⚠️ Error: ${(err as Error).message}` },
-      ]);
-    } finally {
-      setStatus("idle");
-      // Hands-free: jawab bolne ke baad khud dobara suno
-      if (speakReply && voiceOnRef.current) {
-        setTimeout(() => voiceOnRef.current && startRecording(), 400);
-      }
+      setMessages((m) => [...m, { role: "assistant", content: `⚠️ ${(err as Error).message}` }]);
+    }
+
+    if (spoken && reply) {
+      setStatus("speaking");
+      await speak(reply);
+    }
+
+    // hands-free: after a spoken reply keep the session open for a follow-up
+    if (spoken && activeRef.current && powerRef.current) {
+      startRecording();
+    } else if (spoken) {
+      exitActive();
+    } else {
+      setStatus(powerRef.current ? "wake" : "idle");
     }
   }
 
-  function toggleVoice() {
-    if (voiceOn) {
-      setVoiceOn(false);
-      voiceOnRef.current = false;
+  // ---------- controls ----------
+  function togglePower() {
+    if (power) {
+      setPower(false);
+      powerRef.current = false;
+      activeRef.current = false;
+      stopWake();
       stopRecording();
       cleanupAudio();
       window.speechSynthesis?.cancel();
       setStatus("idle");
     } else {
-      setVoiceOn(true);
-      voiceOnRef.current = true;
+      setPower(true);
+      powerRef.current = true;
       window.speechSynthesis?.getVoices();
-      startRecording();
+      startWake();
     }
   }
 
-  const statusLabel: Record<Status, string> = {
-    idle: voiceOn ? "Voice mode on" : "",
-    listening: "🎙️ Sun raha hu… (bolo)",
-    transcribing: "✍️ Samajh raha hu…",
-    thinking: "💭 Soch raha hu…",
-    speaking: "🔊 Bol raha hu…",
+  // tap orb = talk now (skips wake word; works even if wake unsupported)
+  function tapOrb() {
+    if (activeRef.current) return;
+    if (!powerRef.current) { setPower(true); powerRef.current = true; }
+    window.speechSynthesis?.getVoices();
+    stopWake();
+    onWake();
+  }
+
+  const caption: Record<Status, { big: string; sub: string; hint?: boolean }> = {
+    idle: { big: "Standby", sub: "Tap the orb or press Activate" },
+    wake: { big: 'Say "Hey Tyagi"', sub: "…or tap the orb to talk", hint: true },
+    listening: { big: "Listening…", sub: "Speak now" },
+    transcribing: { big: "Got it…", sub: "understanding" },
+    thinking: { big: "Thinking…", sub: "working on it" },
+    speaking: { big: "Speaking…", sub: "" },
   };
+  const cap = caption[status];
 
   return (
-    <div className="chat">
-      <div className="header">
-        <h1>My Agent {voiceOn && <span className="jarvis">· JARVIS mode</span>}</h1>
-        <select
-          value={lang}
-          onChange={(e) => setLang(e.target.value)}
-          className="lang"
-          title="Voice language"
-        >
-          <option value="en-IN">English</option>
-          <option value="hi-IN">हिंदी</option>
-        </select>
+    <div className="app">
+      <div className="topbar">
+        <span className="brand">
+          <span className="dot">◆</span> TYAGI
+        </span>
+        <span className="statuspill">{power ? (status === "wake" ? "awake" : status) : "offline"}</span>
+        <span className="spacer" />
+        <div className="langtoggle">
+          <button className={lang === "en-IN" ? "active" : ""} onClick={() => setLang("en-IN")}>EN</button>
+          <button className={lang === "hi-IN" ? "active" : ""} onClick={() => setLang("hi-IN")}>हि</button>
+        </div>
+        <button className={`powerbtn ${power ? "on" : ""}`} onClick={togglePower} disabled={!micOk}>
+          {power ? "● Online" : "Activate"}
+        </button>
       </div>
 
-      {!supported && (
-        <div className="warn">
-          ⚠️ Voice ke liye mic-enabled browser chahiye (Chrome/Edge/Firefox).
+      {!micOk && <div className="warn">⚠️ Voice needs a mic-enabled browser (Chrome/Edge). You can still type below.</div>}
+      {micOk && !wakeOk && power && (
+        <div className="warn">ℹ️ Wake word not supported here — tap the orb to talk.</div>
+      )}
+
+      <div className="stage">
+        <div ref={orbRef} className={`orb ${status}`} onClick={tapOrb} title="Tap to talk">
+          <div className="ring r1" />
+          <div className="ring r2" />
+          <div className="ring r3" />
+          <div className="core" />
+          <div className="bars">
+            {Array.from({ length: 7 }).map((_, i) => (
+              <span className="bar" key={i} />
+            ))}
+          </div>
+        </div>
+        <div className="caption">
+          <div className={`big ${cap.hint ? "wake-hint" : ""}`}>{cap.big}</div>
+          <div className="sub">{cap.sub}</div>
+        </div>
+      </div>
+
+      {messages.length > 0 && (
+        <div className="transcript">
+          {messages.map((m, i) => (
+            <div key={i} className={`msg ${m.role}`}>{m.content}</div>
+          ))}
+          <div ref={endRef} />
         </div>
       )}
 
-      <div className="messages">
-        {messages.length === 0 && (
-          <div className="msg assistant">Namaste! Type karo ya 🎤 dabake bolo 👋</div>
-        )}
-        {messages.map((m, i) => (
-          <div key={i} className={`msg ${m.role}`}>
-            {m.content}
-          </div>
-        ))}
-        {status !== "idle" && (
-          <div className={`status status-${status}`}>{statusLabel[status]}</div>
-        )}
-        <div ref={endRef} />
-      </div>
-
-      <div className="input-row">
-        <button
-          className={`mic ${voiceOn ? "on" : ""}`}
-          onClick={toggleVoice}
-          disabled={!supported}
-          title={voiceOn ? "Voice band karo" : "Voice chalu karo"}
-        >
-          {voiceOn ? "⏹" : "🎤"}
-        </button>
+      <div className="inputbar">
         <input
           value={input}
           onChange={(e) => setInput(e.target.value)}
           onKeyDown={(e) => e.key === "Enter" && sendMessage(input, false)}
-          placeholder="Message likho…"
-          disabled={status === "thinking"}
+          placeholder="Type a message…  (or say “Hey Tyagi”)"
         />
-        <button
-          onClick={() => sendMessage(input, false)}
-          disabled={status === "thinking" || !input.trim()}
-        >
+        <button onClick={() => sendMessage(input, false)} disabled={!input.trim() || status === "thinking"}>
           Send
         </button>
       </div>

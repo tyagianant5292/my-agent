@@ -3,6 +3,7 @@ jab tak final text jawab na mile."""
 from __future__ import annotations
 
 import json
+import sys
 
 from tools import TOOLS, TOOL_FUNCTIONS
 
@@ -32,6 +33,7 @@ def run_agent(client, model: str, messages: list[dict]) -> str:
                 result = func(**args) if func else f"Unknown tool: {name}"
             except Exception as e:
                 result = f"Tool error: {e}"
+            print(f"[agent] tool={name} args={args} -> {str(result)[:120]}", file=sys.stderr)
             messages.append({
                 "role": "tool",
                 "tool_call_id": call.id,

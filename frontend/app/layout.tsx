@@ -2,8 +2,8 @@ import type { Metadata } from "next";
 import "./globals.css";
 
 export const metadata: Metadata = {
-  title: "My Agent",
-  description: "Apna agentic AI chatbot",
+  title: "Tyagi — Voice Assistant",
+  description: 'Say "Hey Tyagi" — a Jarvis-style voice assistant by Anant Kumar',
 };
 
 export default function RootLayout({
