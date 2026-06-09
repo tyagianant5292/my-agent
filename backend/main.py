@@ -15,7 +15,7 @@ from typing import Optional
 from dotenv import load_dotenv
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from openai import OpenAI
+from openai import OpenAI, RateLimitError
 from pydantic import BaseModel
 
 import db
@@ -122,7 +122,19 @@ def chat(req: ChatRequest):
     messages = [{"role": "system", "content": SYSTEM_PROMPT}, *history]
     messages.append({"role": "user", "content": req.message})
 
-    reply = run_agent(client, MODEL, messages)
+    try:
+        reply = run_agent(client, MODEL, messages)
+    except RateLimitError:
+        # Free Groq tier daily/again limit — show a friendly note, don't crash.
+        return ChatResponse(
+            conversation_id=conv_id,
+            reply=(
+                "⚠️ I've hit the free AI usage limit for now. Please try again in a little "
+                "while — the daily quota resets, and it should work again soon."
+            ),
+        )
+    except Exception as e:  # noqa: BLE001
+        return ChatResponse(conversation_id=conv_id, reply=f"⚠️ Something went wrong: {e}")
 
     # Sirf user + final assistant text store karte hain (clean history).
     db.save_message(conv_id, "user", req.message)
