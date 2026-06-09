@@ -8,6 +8,7 @@ Local run:
 from __future__ import annotations
 
 import os
+import re
 import uuid
 from contextlib import asynccontextmanager
 from typing import Optional
@@ -85,6 +86,30 @@ class ChatRequest(BaseModel):
 class ChatResponse(BaseModel):
     conversation_id: str
     reply: str
+    retry_after: Optional[float] = None  # seconds until rate limit frees up
+
+
+def _retry_after_seconds(err) -> Optional[float]:
+    """RateLimitError se nikalta hai ki kitne seconds baad dobara try karein."""
+    # 1) Standard retry-after header (Groq isse bhejta hai).
+    try:
+        headers = err.response.headers
+        ra = headers.get("retry-after")
+        if ra:
+            return float(ra)
+        ra_ms = headers.get("retry-after-ms")
+        if ra_ms:
+            return float(ra_ms) / 1000
+    except Exception:  # noqa: BLE001
+        pass
+    # 2) Fallback: message se parse karo, e.g. "try again in 13m1.92s".
+    text = str(getattr(err, "message", "") or err)
+    m = re.search(r"try again in\s+(?:(\d+)m)?\s*([\d.]+)s", text)
+    if m:
+        mins = int(m.group(1) or 0)
+        secs = float(m.group(2) or 0)
+        return mins * 60 + secs
+    return None
 
 
 @app.get("/api/health")
@@ -124,14 +149,12 @@ def chat(req: ChatRequest):
 
     try:
         reply = run_agent(client, MODEL, messages)
-    except RateLimitError:
-        # Free Groq tier daily/again limit — show a friendly note, don't crash.
+    except RateLimitError as e:
+        # Free Groq tier limit — friendly note + when it'll work again (no crash).
         return ChatResponse(
             conversation_id=conv_id,
-            reply=(
-                "⚠️ I've hit the free AI usage limit for now. Please try again in a little "
-                "while — the daily quota resets, and it should work again soon."
-            ),
+            reply="⚠️ I've reached the free AI usage limit right now.",
+            retry_after=_retry_after_seconds(e),
         )
     except Exception as e:  # noqa: BLE001
         return ChatResponse(conversation_id=conv_id, reply=f"⚠️ Something went wrong: {e}")

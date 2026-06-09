@@ -336,6 +336,14 @@ export default function Home() {
       const data = await res.json();
       conversationIdRef.current = data.conversation_id;
       reply = data.reply;
+      if (data.retry_after) {
+        const secs = Math.ceil(data.retry_after);
+        const mins = Math.ceil(secs / 60);
+        const at = new Date(Date.now() + secs * 1000);
+        const t = at.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+        const when = secs < 90 ? `${secs} seconds` : `about ${mins} minute${mins > 1 ? "s" : ""}`;
+        reply += `\n\n⏳ Try again in ${when} — around ${t} your time.`;
+      }
       setLastAssistant(reply);
     } catch {
       setLastAssistant(
