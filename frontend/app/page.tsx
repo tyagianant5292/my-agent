@@ -15,6 +15,13 @@ const MAX_MS = 20000;
 // Greeting is optional; the distinctive "tyagi"-like name core is required.
 const WAKE_RE = /\b(?:hey|hay|hi|ok|okay|ay|a)?\s*(?:t[hy]?i?yagi|tyagee|tyaji|tiagi|tyagy)\b/i;
 
+// Common Whisper hallucinations on silence/near-silence — never send these.
+const HALLUCINATIONS = new Set([
+  "you", "thankyou", "thanks", "thanksforwatching", "thankyouforwatching",
+  "okay", "ok", "bye", "byebye", "please", "subscribe", "pleasesubscribe",
+  "ididnthearyourvoice", "ididnthearyou", "uh", "um", "hmm", "ah", "oh", "so",
+]);
+
 type Message = { role: "user" | "assistant"; content: string };
 type Status = "idle" | "wake" | "listening" | "transcribing" | "thinking" | "speaking";
 
@@ -263,7 +270,9 @@ export default function Home() {
     chime();
     setStatus("speaking");
     await speak(langRef.current.startsWith("hi") ? "Haan, boliye." : "Yes?");
-    startRecording();
+    // small gap so the greeting audio clears the mic before we start recording
+    await new Promise((r) => setTimeout(r, 400));
+    if (activeRef.current) startRecording();
   }
 
   function exitActive() {
@@ -357,8 +366,14 @@ export default function Home() {
       const res = await fetchWithRetry(`${API_URL}/api/transcribe`, { method: "POST", body: fd });
       if (!res.ok) throw new Error(`Transcribe error: ${res.status}`);
       const { text } = await res.json();
-      if (!text || !text.trim()) { exitActive(); return; }
-      await sendMessage(text.trim(), true);
+      const cleaned = (text || "").trim();
+      const norm = cleaned.toLowerCase().replace(/[^a-z0-9ऀ-ॿ]/g, "");
+      // Drop empty / too-short / known-hallucination transcripts (silence noise).
+      if (!cleaned || norm.length < 2 || HALLUCINATIONS.has(norm)) {
+        exitActive();
+        return;
+      }
+      await sendMessage(cleaned, true);
     } catch (err) {
       setMessages((m) => [...m, { role: "assistant", content: `⚠️ ${(err as Error).message}` }]);
       exitActive();
@@ -419,7 +434,8 @@ export default function Home() {
 
     // hands-free: after a spoken reply keep the session open for a follow-up
     if (spoken && activeRef.current && powerRef.current) {
-      startRecording();
+      await new Promise((r) => setTimeout(r, 400)); // avoid catching our own TTS tail
+      if (activeRef.current && powerRef.current) startRecording();
     } else if (spoken) {
       exitActive();
     } else {
