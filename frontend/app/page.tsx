@@ -46,6 +46,31 @@ export default function Home() {
   useEffect(() => { langRef.current = lang; }, [lang]);
   useEffect(() => { endRef.current?.scrollIntoView({ behavior: "smooth" }); }, [messages, status]);
 
+  // Restore the conversation across refreshes (backend keeps history by id in Neon).
+  useEffect(() => {
+    try {
+      const cid = localStorage.getItem("tyagi_conv_id");
+      if (cid) conversationIdRef.current = cid;
+      const saved = localStorage.getItem("tyagi_messages");
+      if (saved) {
+        const parsed = JSON.parse(saved);
+        if (Array.isArray(parsed)) setMessages(parsed);
+      }
+    } catch {
+      /* ignore */
+    }
+  }, []);
+
+  // Persist the visible transcript so a refresh recalls the same chat.
+  useEffect(() => {
+    try {
+      const toSave = messages.filter((m) => m.content && m.content !== "…");
+      if (toSave.length) localStorage.setItem("tyagi_messages", JSON.stringify(toSave.slice(-100)));
+    } catch {
+      /* ignore */
+    }
+  }, [messages]);
+
   useEffect(() => {
     const hasMedia =
       typeof navigator !== "undefined" &&
@@ -366,6 +391,11 @@ export default function Home() {
       if (!res.ok) throw new Error(`Server error ${res.status}`);
       const data = await res.json();
       conversationIdRef.current = data.conversation_id;
+      try {
+        localStorage.setItem("tyagi_conv_id", data.conversation_id);
+      } catch {
+        /* ignore */
+      }
       reply = data.reply;
       if (data.retry_after) {
         const secs = Math.ceil(data.retry_after);
@@ -416,6 +446,17 @@ export default function Home() {
     }
   }
 
+  function newChat() {
+    conversationIdRef.current = null;
+    setMessages([]);
+    try {
+      localStorage.removeItem("tyagi_conv_id");
+      localStorage.removeItem("tyagi_messages");
+    } catch {
+      /* ignore */
+    }
+  }
+
   // tap orb = talk now (skips wake word). If a session is stuck, tap resets it.
   function tapOrb() {
     if (activeRef.current) {
@@ -455,6 +496,11 @@ export default function Home() {
         </span>
         <span className="statuspill">{power ? (status === "wake" ? "awake" : status) : "offline"}</span>
         <span className="spacer" />
+        {messages.length > 0 && (
+          <button className="newbtn" onClick={newChat} title="Start a new conversation">
+            ＋ New
+          </button>
+        )}
         <div className="langtoggle">
           <button className={lang === "en-IN" ? "active" : ""} onClick={() => setLang("en-IN")}>EN</button>
           <button className={lang === "hi-IN" ? "active" : ""} onClick={() => setLang("hi-IN")}>हि</button>
