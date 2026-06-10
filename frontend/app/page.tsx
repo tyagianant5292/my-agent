@@ -12,7 +12,8 @@ const NO_SPEECH_MS = 6000;
 const MAX_MS = 20000;
 
 // Wake phrase matcher — lenient for STT variants of "Hey Tyagi".
-const WAKE_RE = /\b(hey|hay|hi|ok|okay|a)\s*(tyagi|tyagee|tyaji|tiagi|tyag|yagi|tyagy|tagi)\b/i;
+// Greeting is optional; the distinctive "tyagi"-like name core is required.
+const WAKE_RE = /\b(?:hey|hay|hi|ok|okay|ay|a)?\s*(?:t[hy]?i?yagi|tyagee|tyaji|tiagi|tyagy)\b/i;
 
 type Message = { role: "user" | "assistant"; content: string };
 type Status = "idle" | "wake" | "listening" | "transcribing" | "thinking" | "speaking";
@@ -99,15 +100,39 @@ export default function Home() {
 
   function speak(text: string): Promise<void> {
     return new Promise((resolve) => {
-      if (typeof window.speechSynthesis === "undefined" || !text) return resolve();
-      window.speechSynthesis.cancel();
+      const synth = typeof window !== "undefined" ? window.speechSynthesis : undefined;
+      if (!synth || !text) return resolve();
+      try {
+        synth.cancel();
+      } catch {
+        /* ignore */
+      }
+      let done = false;
+      let watch: ReturnType<typeof setTimeout>;
+      const finish = () => {
+        if (done) return;
+        done = true;
+        clearTimeout(watch);
+        resolve();
+      };
       const u = new SpeechSynthesisUtterance(text);
       u.lang = langRef.current;
-      const match = window.speechSynthesis.getVoices().find((v) => v.lang === langRef.current);
+      const match = synth.getVoices().find((v) => v.lang === langRef.current);
       if (match) u.voice = match;
-      u.onend = () => resolve();
-      u.onerror = () => resolve();
-      window.speechSynthesis.speak(u);
+      u.onend = finish;
+      u.onerror = finish;
+      // Failsafe: Chrome sometimes never fires onend — resolve after an estimate
+      // so the assistant never gets stuck on "speaking".
+      watch = setTimeout(finish, Math.min(16000, 1500 + text.length * 80));
+      // tiny delay after cancel() + resume() avoids a known Chrome stuck-speech bug
+      setTimeout(() => {
+        try {
+          synth.resume();
+          synth.speak(u);
+        } catch {
+          finish();
+        }
+      }, 70);
     });
   }
 
@@ -172,7 +197,13 @@ export default function Home() {
         }
       }
     };
-    rec.onerror = () => {};
+    rec.onerror = (e: any) => {
+      // Permission errors are fatal; everything else (no-speech, network, aborted)
+      // is recoverable and onend will restart us.
+      if (e?.error === "not-allowed" || e?.error === "service-not-allowed") {
+        setWakeOk(false);
+      }
+    };
     rec.onend = () => {
       recOnRef.current = false;
       // auto-restart while powered and not in a command session
@@ -385,10 +416,22 @@ export default function Home() {
     }
   }
 
-  // tap orb = talk now (skips wake word; works even if wake unsupported)
+  // tap orb = talk now (skips wake word). If a session is stuck, tap resets it.
   function tapOrb() {
-    if (activeRef.current) return;
-    if (!powerRef.current) { setPower(true); powerRef.current = true; }
+    if (activeRef.current) {
+      // escape hatch: cancel a stuck/active session and go back to listening
+      window.speechSynthesis?.cancel();
+      activeRef.current = false;
+      stopRecording();
+      cleanupAudio();
+      if (powerRef.current) startWake();
+      else setStatus("idle");
+      return;
+    }
+    if (!powerRef.current) {
+      setPower(true);
+      powerRef.current = true;
+    }
     window.speechSynthesis?.getVoices();
     stopWake();
     onWake();
