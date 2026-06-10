@@ -86,6 +86,15 @@ export default function Home() {
     if (!hasMedia) setMicOk(false);
     const SR = (window as any).SpeechRecognition || (window as any).webkitSpeechRecognition;
     if (!SR) setWakeOk(false);
+    // Preload TTS voices (Chrome loads them asynchronously).
+    try {
+      window.speechSynthesis?.getVoices();
+      if (window.speechSynthesis) {
+        window.speechSynthesis.onvoiceschanged = () => window.speechSynthesis.getVoices();
+      }
+    } catch {
+      /* ignore */
+    }
     // Warm up the free-tier backend so it's awake by the time the user talks.
     fetch(`${API_URL}/api/health`).catch(() => {});
   }, []);
@@ -148,9 +157,22 @@ export default function Home() {
         resolve();
       };
       const u = new SpeechSynthesisUtterance(text);
-      u.lang = langRef.current;
-      const match = synth.getVoices().find((v) => v.lang === langRef.current);
-      if (match) u.voice = match;
+      // Pick an actually-available voice. macOS Chrome often has no "en-IN"
+      // voice — setting u.lang to it with no voice = silence. Fall back to en-US.
+      const voices = synth.getVoices();
+      const want = langRef.current;
+      const base = want.split("-")[0];
+      const voice =
+        voices.find((v) => v.lang === want) ||
+        voices.find((v) => v.lang.replace("_", "-").toLowerCase().startsWith(base)) ||
+        voices.find((v) => v.lang.toLowerCase().startsWith("en")) ||
+        voices[0];
+      if (voice) {
+        u.voice = voice;
+        u.lang = voice.lang;
+      } else {
+        u.lang = base === "hi" ? "hi-IN" : "en-US";
+      }
       u.onend = finish;
       u.onerror = finish;
       // Failsafe: Chrome sometimes never fires onend — resolve after an estimate
@@ -512,6 +534,15 @@ export default function Home() {
         </span>
         <span className="statuspill">{power ? (status === "wake" ? "awake" : status) : "offline"}</span>
         <span className="spacer" />
+        <button
+          className="newbtn"
+          onClick={() =>
+            speak(langRef.current.startsWith("hi") ? "Namaste, main Tyagi. Kya aap meri awaaz sun pa rahe hain?" : "Hi, this is Tyagi. Can you hear me?")
+          }
+          title="Test voice (speaker)"
+        >
+          🔊
+        </button>
         {messages.length > 0 && (
           <button className="newbtn" onClick={newChat} title="Start a new conversation">
             ＋ New
